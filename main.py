@@ -2581,7 +2581,7 @@ class WorkerScheduler:
                 if first_run:
                     first_run = False
                 else:
-                    await asyncio.sleep(Config.SOURCE_REFRESH_SECONDS)
+                    await asyncio.sleep(15)  # Short delay between cycles to prevent CPU overload
 
                 sources = await self.db.get_sources(enabled_only=True)
                 due_sources = []
@@ -2621,7 +2621,7 @@ class WorkerScheduler:
     async def discovery_scheduler_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                await asyncio.sleep(Config.DISCOVERY_INTERVAL_SECONDS)
+                await asyncio.sleep(15)  # Short delay between cycles to prevent CPU overload
                 added = await self.sources.run_discovery_pass()
                 if added > 0:
                     logger.info("[DISCOVERY] Auto-discovered %s new proxy sources.", added)
@@ -2633,7 +2633,7 @@ class WorkerScheduler:
     async def prune_scheduler_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                await asyncio.sleep(Config.PRUNE_CHECK_INTERVAL_SECONDS)
+                await asyncio.sleep(15)  # Short delay between cycles to prevent CPU overload
                 result = await self.db.prune_dead_weight()
                 total = sum(result.values())
                 if total > 0:
