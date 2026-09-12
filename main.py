@@ -859,34 +859,47 @@ class Database:
         return self.cols.get(platform, self.cols["youtube"])
 
     async def connect(self) -> None:
-        self.client = AsyncMongoClient(
-            Config.MONGO_URI,
-            serverSelectionTimeoutMS=8000,
-            connectTimeoutMS=8000,
-            socketTimeoutMS=20000,
-            retryWrites=True,
-        )
-        await self.client.admin.command("ping")
-        self.db = self.client[Config.MONGO_DB_NAME]
+        max_retries = 5
+        base_delay = 1.0  # Start with 1 second delay
 
-        self.cols = {
-            "youtube": self.db[Config.COLLECTION_NAMES["youtube"]],
-            "instagram": self.db[Config.COLLECTION_NAMES["instagram"]],
-            "tiktok": self.db[Config.COLLECTION_NAMES["tiktok"]],
-        }
+        for attempt in range(max_retries):
+            try:
+                self.client = AsyncMongoClient(
+                    Config.MONGO_URI,
+                    serverSelectionTimeoutMS=8000,
+                    connectTimeoutMS=8000,
+                    socketTimeoutMS=20000,
+                    retryWrites=True,
+                )
+                await self.client.admin.command("ping")
+                self.db = self.client[Config.MONGO_DB_NAME]
 
-        self.sources = self.db["proxy_sources"]
-        self.tasks = self.db["proxy_tasks"]
-        self.snapshots = self.db["proxy_source_snapshots"]
-        self.events = self.db["proxy_events"]
-        self.daily = self.db["proxy_daily_summary"]
-        self.worker_config = self.db["worker_config"]
-        self.reputation = self.db["proxy_reputation"]
-        self.archive = self.db["proxy_archive"]
-        self.export_snapshots = self.db["export_snapshots"]
+                self.cols = {
+                    "youtube": self.db[Config.COLLECTION_NAMES["youtube"]],
+                    "instagram": self.db[Config.COLLECTION_NAMES["instagram"]],
+                    "tiktok": self.db[Config.COLLECTION_NAMES["tiktok"]],
+                }
 
-        await self.ensure_indexes()
-        logger.info("[DB] Connected. Active collections: %s", list(Config.COLLECTION_NAMES.values()))
+                self.sources = self.db["proxy_sources"]
+                self.tasks = self.db["proxy_tasks"]
+                self.snapshots = self.db["proxy_source_snapshots"]
+                self.events = self.db["proxy_events"]
+                self.daily = self.db["proxy_daily_summary"]
+                self.worker_config = self.db["worker_config"]
+                self.reputation = self.db["proxy_reputation"]
+                self.archive = self.db["proxy_archive"]
+                self.export_snapshots = self.db["export_snapshots"]
+
+                await self.ensure_indexes()
+                logger.info("[DB] Connected. Active collections: %s", list(Config.COLLECTION_NAMES.values()))
+                return  # Success, exit the retry loop
+            except Exception as e:
+                if attempt == max_retries - 1:  # Last attempt
+                    logger.error(f"[DB] Failed to connect to MongoDB after {max_retries} attempts: {e}")
+                    raise
+                delay = base_delay * (2 ** attempt)  # Exponential backoff
+                logger.warning(f"[DB] MongoDB connection attempt {attempt + 1} failed: {e}. Retrying in {delay:.1f}s...")
+                await asyncio.sleep(delay)
 
     async def ensure_indexes(self) -> None:
         for platform, col in self.cols.items():
@@ -1318,6 +1331,10 @@ class Database:
             else:
                 p_update["state"] = PlatformState.DISABLED
                 p_update["next_check_at"] = None
+
+        # Set working field correctly: True only if state is WORKING and validation succeeded
+        final_state = p_update.get("state", p_stat.get("state"))
+        p_update["working"] = success and (final_state == PlatformState.WORKING)
 
         meta_update[f"platform_status.{platform}"] = {**p_stat, **p_update}
 
@@ -3106,6 +3123,8 @@ class Application:
     async def start(self) -> None:
         Config.validate()
         await self.db.connect()
+        # Release any stale leases from previous runs
+        await self.db.release_expired_leases()
         await self.sources.start()
         await self.admin_ui.setup()
         await self.admin_ui.start()
