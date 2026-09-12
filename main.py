@@ -2101,8 +2101,12 @@ class ProxySourceManager:
             text, content_type, byte_count = await self.fetch(fetch_url)
         except Exception:
             logger.warning("[SOURCE] Initial fetch failed for %s, trying fresh directory resolution...", source_id)
-            fetch_url, fmt = await self.resolve_source_url(source, force_re_resolve=True)
-            text, content_type, byte_count = await self.fetch(fetch_url)
+            try:
+                fetch_url, fmt = await self.resolve_source_url(source, force_re_resolve=True)
+                text, content_type, byte_count = await self.fetch(fetch_url)
+            except Exception:
+                logger.error("[SOURCE] Retry fetch also failed for %s", source_id)
+                raise
 
         content_hash = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
         if source.get("last_content_hash") == content_hash:
