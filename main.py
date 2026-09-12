@@ -1,105 +1,42 @@
 #!/usr/bin/env python3
 """
-Dedicated Proxy Worker Bot - Multi-Platform Implementation (v5).
+Dedicated Proxy Worker Bot - Multi-Platform Implementation (v4).
 
-============================================================================
-V5 CHANGELOG (maps directly to the requested fixes)
-============================================================================
- 1. MIGRATION SYSTEM FULLY REMOVED
-    - Deleted the legacy per-platform "migration source" collections, the
-      Settings subpanels, the Check/Retry + Migrate/Import buttons, the
-      migration audit log, and every related DB/UI code path.
-    - This also fixes a live crash bug: v4 still *instantiated* an
-      undefined `MigrationService` class at startup (a leftover from a
-      partial manual removal), which would raise NameError before the
-      bot could ever come online. That dangling reference is gone.
+V4 CHANGELOG (summary - see chat explanation for full detail)
+PROBLEM FIXED:
+  - v3 already had per-platform collections, but under the wrong names
+    (proxies / proxies_instagram / proxies_tiktok) and with no way to
+    move data between old and new storage.
+  - PER_PLATFORM_TEST_BUDGET existed but was never enforced.
+  - Working-proxy revalidation used a flat interval -> thundering herd risk.
 
- 2. NO MORE GLOBAL 429 / CHALLENGE FREEZE
-    - Removed `BaseValidator.trigger_rate_limit_backoff()` /
-      `is_rate_limited()`, which used to pause an ENTIRE platform
-      validator (shared across every proxy) for 15-30 minutes whenever
-      any single proxy got a 429.
-    - 429/challenge responses now only ever touch the ONE proxy that
-      triggered them: `Database.record_platform_result()` applies an
-      escalating, per-proxy-only cooldown (`consecutive_429_count`) and
-      immediately frees up the dispatcher to claim the next proxy.
+WHAT CHANGED:
+  - The old per-platform collections are now treated as READ-ONLY LEGACY
+    sources (never written to, never deleted from, never mutated).
+  - Three new collections with the EXACT required names are created and
+    used for everything going forward: "YouTube", "Instagram", "TikTok".
+  - A new Settings section (Telegram) exposes, per platform, two SEPARATE
+    actions: Check/Retry (live re-test, no writes to destination) and
+    Migrate/Import (copy into new collection, dedup + idempotent).
+  - Bandwidth budget guard is now actually enforced.
+  - Working-state revalidation is staggered across a rolling window.
 
- 3. VALIDATION ENGINE / TIKTOK DETECTION
-    - New dedicated `TikTokValidator` with modern browser headers,
-      redirect following, and response-body inspection for soft-block /
-      captcha "verify" walls that return HTTP 200 (not just status-code
-      checks), to cut down false negatives AND false positives.
-    - Quality score (0-100) now genuinely drives proxy selection (see #8).
+NEW FEATURES (11):
+  1. Proxy Benchmark / Quality Score (0-100)
+  2. Paced / Staged Revalidation (rolling ~48h window, no thundering herd)
+  3. Cross-Platform Reuse Check
+  4. Persistent Reputation Memory
+  5. Bandwidth Budget Guard (now enforced)
+  6. Circuit Breaker for Mass Failures
+  7. Automatic Pruning of Dead Weight (archival)
+  8. Manual Pin / Priority Override (/pin, /unpin)
+  9. Snapshot Export History (diffed exports)
+  10. Migration Audit Log
+  11. Safe Re-Run Protection (idempotency everywhere)
 
- 4/#9. REAL <=2-HOUR NON-DESTRUCTIVE REVALIDATION
-    - `Config.QUARANTINE_RETEST_MAX_SECONDS` (default 7200s = 2h) is now
-      hard-clamped onto every quarantine retry calculation, regardless of
-      flap-recovery speed-ups or reputation-penalty slow-downs, so a
-      failed proxy is *always* re-tested within 2 hours - never silently
-      pushed out by the (unrelated) 48h WORKING-proxy stagger window.
-    - Failures never delete a proxy; they only move it through
-      WORKING -> QUARANTINED -> DISABLED, and DISABLED proxies are only
-      ever archived (moved to `proxy_archive`), never destroyed.
-
- 5/#9/#10. FASTER, CONCURRENT, CONTINUOUS DISCOVERY
-    - Source refresh and GitHub-tree discovery now run many sources
-      concurrently (bounded by `SOURCE_FETCH_CONCURRENCY`) instead of
-      one-at-a-time, without blocking the validation dispatchers.
-    - Runs forever on its own schedule (`discovery_scheduler_loop` /
-      `periodic_scheduler_loop`), not just when a user asks.
-
- 6. PER-PLATFORM "ADD FILE" BUTTON
-    - Every platform subpanel (YouTube/Instagram/TikTok) now has an
-      "Add File" button. Tapping it arms a per-user, per-platform upload
-      state; the next document that user sends is fast-tracked and
-      tested ONLY against that platform, with live-edited progress
-      (done/working/failed counts + a rolling list of hits).
-    - The original, platform-agnostic Global TXT/CSV/JSON upload (which
-      tests a file against all three platforms) is untouched.
-
- 8. QUALITY SCORE ACTUALLY DRIVES SELECTION
-    - `claim_proxy()` now sorts pinned-first, then by `quality_score`
-      DESC, then by due time - so the queue itself, not just the export,
-      prefers proven, fast, reliable proxies. Exports were already
-      quality-ranked and remain so.
-
- 9 (independence). Platforms remain fully isolated: separate Mongo
-    collections per platform, independent `platform_status` state
-    machines, independent cooldowns/circuit breakers/bandwidth budgets.
-    `enqueue_cross_platform_check()` only ever *queues a candidate test*
-    on other platforms - it never marks a proxy "working" anywhere
-    without that platform verifying it itself.
-
- 11. ADAPTIVE CONCURRENCY / BANDWIDTH
-    - Each platform now runs a small pool of concurrent worker
-      coroutines (not one sequential loop), sized dynamically by
-      `concurrency_controller_loop()` based on backlog size and recent
-      failure rate, capped by `MAX_WORKERS_PER_PLATFORM` and the global
-      `TEST_CONCURRENCY` semaphore. Circuit-open platforms scale to 0
-      workers instead of hammering a dead route.
-
- 12. FORMAT-AGNOSTIC FILE IMPORT
-    - `sniff_and_parse()` content-sniffs uploads (JSON / CSV-like /
-      plain text) regardless of file extension, so .log, .lst, or
-      extension-less exports all work. Malformed lines are skipped
-      without aborting the batch.
-
- 13/#14/#15/#16. SELF-DIAGNOSTIC FIXES
-    - Fixed the dangling `MigrationService` crash (see #1).
-    - `upsert_proxy_to_platforms()` is now a single atomic
-      `update_one(..., upsert=True)` per platform (via `$setOnInsert` /
-      `$addToSet`) instead of find-then-insert, removing a race window
-      where concurrent discovery workers or multi-worker validation
-      pools could create duplicate proxy documents.
-    - `claim_proxy()` was already atomic (`find_one_and_update`), which
-      is what makes it safe to run several concurrent workers per
-      platform now that dispatch is no longer a single sequential loop.
-
-Everything else from v4 (YouTube/Instagram/TikTok validators, staged
-WORKING -> QUARANTINED -> DISABLED state machine, quality scoring,
-staggered revalidation, circuit breaker, bandwidth budget, pinning,
-pruning/archival, cross-platform reuse, reputation memory, export-diff
-snapshots, Telegram admin UI, health server) is preserved.
+Everything from v3 (YouTube + Instagram + TikTok validators, staged
+WORKING -> QUARANTINED -> DISABLED state machine, Telegram admin UI,
+source discovery/ingestion, health server, etc.) is preserved.
 """
 
 from __future__ import annotations
@@ -117,7 +54,7 @@ import shutil
 import signal
 import sys
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -200,10 +137,16 @@ class Config:
     MONGO_URI = os.getenv("MONGO_URI", "").strip()
     MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "telegram_downloader").strip()
 
-    # Active per-platform collections. These are the ONLY proxy
-    # collections the engine reads from or writes to (Requirement #1:
-    # legacy migration collections/logic have been fully removed).
-    COLLECTION_NAMES = {"youtube": "YouTube", "instagram": "Instagram", "tiktok": "TikTok"}
+    # --- LEGACY per-platform collections (read-only migration source). ---
+    # These are the collections your bot already used in v3. They are NEVER
+    # written to, deleted from, or mutated by v4 - they exist purely so the
+    # Settings -> Check/Retry / Migrate/Import tools can pull historical data.
+    PROXY_COLLECTION_YT = os.getenv("MONGO_COLLECTION", "proxies").strip()
+    PROXY_COLLECTION_IG = os.getenv("MONGO_COLLECTION_IG", "proxies_instagram").strip()
+    PROXY_COLLECTION_TT = os.getenv("MONGO_COLLECTION_TT", "proxies_tiktok").strip()
+
+    # --- NEW active collections. Names are fixed exactly as required. ---
+    NEW_COLLECTION_NAMES = {"youtube": "YouTube", "instagram": "Instagram", "tiktok": "TikTok"}
 
     PORT = env_int("PORT", 8080, 1, 65535)
 
@@ -215,14 +158,11 @@ class Config:
 
     # Concurrency & Schedulers
     SOURCE_REFRESH_SECONDS = env_int("SOURCE_REFRESH_SECONDS", 300, 30)
-    SOURCE_FETCH_CONCURRENCY = env_int("SOURCE_FETCH_CONCURRENCY", 5, 1, 50)
-    TEST_CONCURRENCY = env_int("PROXY_TEST_CONCURRENCY", 20, 1, 200)
-    MAX_WORKERS_PER_PLATFORM = env_int("MAX_WORKERS_PER_PLATFORM", 8, 1, 50)
-    PER_PLATFORM_TEST_BUDGET = env_int("PER_PLATFORM_TEST_BUDGET", 600, 10, 20000)
+    TEST_CONCURRENCY = env_int("PROXY_TEST_CONCURRENCY", 10, 1, 100)
+    MAX_PENDING_TESTS = env_int("MAX_PENDING_TESTS", 2000, 1, 20000)
+    MAX_TEST_PER_REFRESH = env_int("MAX_PROXIES_PER_REFRESH", 300, 1, 5000)
+    PER_PLATFORM_TEST_BUDGET = env_int("PER_PLATFORM_TEST_BUDGET", 150, 10, 2000)
     DISCOVERY_INTERVAL_SECONDS = env_int("DISCOVERY_INTERVAL_SECONDS", 1800, 300)
-    DISCOVERY_FETCH_CONCURRENCY = env_int("DISCOVERY_FETCH_CONCURRENCY", 5, 1, 50)
-    ADHOC_TEST_CONCURRENCY = env_int("ADHOC_TEST_CONCURRENCY", 10, 1, 100)
-    CONTROLLER_INTERVAL_SECONDS = env_int("CONTROLLER_INTERVAL_SECONDS", 20, 5, 300)
 
     # Timeouts
     CONNECT_CHECK_TIMEOUT = env_int("CONNECT_CHECK_TIMEOUT", 6, 1, 30)
@@ -234,10 +174,9 @@ class Config:
 
     # State Machine Intervals
     WORKING_CHECK_INTERVAL = env_int("WORKING_CHECK_INTERVAL", 3600, 300)        # 1 hour base
-    WORKING_REVALIDATION_WINDOW_SECONDS = env_int("WORKING_REVALIDATION_WINDOW_SECONDS", 172800, 3600)  # stagger window for healthy proxies
-    QUARANTINE_CHECK_INTERVAL = env_int("QUARANTINE_CHECK_INTERVAL", 3600, 300)   # base retry wait while quarantined
-    QUARANTINE_RETEST_MAX_SECONDS = env_int("QUARANTINE_RETEST_MAX_SECONDS", 7200, 300, 21600)  # HARD cap: retested within <= 2h
-    QUARANTINE_HARD_CUTOFF = env_int("QUARANTINE_HARD_CUTOFF", 172800, 3600)      # 48h of continuous failure before DISABLED (never deleted)
+    WORKING_REVALIDATION_WINDOW_SECONDS = env_int("WORKING_REVALIDATION_WINDOW_SECONDS", 172800, 3600)  # Feature 2
+    QUARANTINE_CHECK_INTERVAL = env_int("QUARANTINE_CHECK_INTERVAL", 18000, 600)  # 5 hours
+    QUARANTINE_HARD_CUTOFF = env_int("QUARANTINE_HARD_CUTOFF", 172800, 3600)     # 48 hours
     ORPHAN_RETIRE_AFTER_SECONDS = env_int("ORPHAN_RETIRE_AFTER_SECONDS", 7 * 86400, 3600)
 
     # Validation Flags & Targets (Target Rotation Pools)
@@ -293,23 +232,27 @@ class Config:
     DAILY_REPORT_MINUTE = env_int("DAILY_REPORT_MINUTE", 0, 0, 59)
     DEBUG = env_bool("DEBUG", False)
 
-    # --- Bandwidth budget guard ---
+    # --- V4: Migration settings ---
+    MIGRATION_TEST_CONCURRENCY = env_int("MIGRATION_TEST_CONCURRENCY", 5, 1, 50)
+    MIGRATION_RETRY_FRESHNESS_SECONDS = env_int("MIGRATION_RETRY_FRESHNESS_SECONDS", 1800, 60)
+
+    # --- V4: Bandwidth budget guard (Feature 5) ---
     BANDWIDTH_BUDGET_WINDOW_SECONDS = env_int("BANDWIDTH_BUDGET_WINDOW_SECONDS", 3600, 60)
 
-    # --- Circuit breaker ---
+    # --- V4: Circuit breaker (Feature 6) ---
     CIRCUIT_BREAKER_FAILURE_THRESHOLD = env_float("CIRCUIT_BREAKER_FAILURE_THRESHOLD", 0.8, 0.1, 1.0)
     CIRCUIT_BREAKER_MIN_SAMPLES = env_int("CIRCUIT_BREAKER_MIN_SAMPLES", 20, 5)
     CIRCUIT_BREAKER_WINDOW_SECONDS = env_int("CIRCUIT_BREAKER_WINDOW_SECONDS", 600, 60)
     CIRCUIT_BREAKER_COOLDOWN_SECONDS = env_int("CIRCUIT_BREAKER_COOLDOWN_SECONDS", 1800, 60)
 
-    # --- Pruning / archival (non-destructive: archive-then-delete only after this long DISABLED) ---
+    # --- V4: Pruning / archival (Feature 7) ---
     PRUNE_DISABLED_AFTER_SECONDS = env_int("PRUNE_DISABLED_AFTER_SECONDS", 7 * 86400, 3600)
     PRUNE_CHECK_INTERVAL_SECONDS = env_int("PRUNE_CHECK_INTERVAL_SECONDS", 3600, 300)
 
-    # --- Cross-platform reuse ---
+    # --- V4: Cross-platform reuse (Feature 3) ---
     CROSS_PLATFORM_REUSE_ENABLED = env_bool("CROSS_PLATFORM_REUSE_ENABLED", True)
 
-    # --- Reputation memory ---
+    # --- V4: Reputation memory (Feature 4) ---
     REPUTATION_FAILURE_PENALTY_STEP = env_int("REPUTATION_FAILURE_PENALTY_STEP", 5, 1, 50)
     REPUTATION_MAX_PENALTY = env_int("REPUTATION_MAX_PENALTY", 60, 0, 100)
 
@@ -353,7 +296,7 @@ logging.basicConfig(
     level=logging.DEBUG if Config.DEBUG else logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("proxy-worker-v5")
+logger = logging.getLogger("proxy-worker-v4")
 logger.addFilter(SecretFilter())
 
 UTC = timezone.utc
@@ -426,12 +369,9 @@ class FailureCategory:
     SUCCESS = "success"
     UNKNOWN = "unknown"
 
-    # Categories that reflect a transient/target-side condition rather than
-    # a real proxy fault. Handled distinctly from 429 (see #2 below), which
-    # gets its own escalating-but-strictly-per-proxy cooldown.
-    NON_ROUTE_SPECIFIC = frozenset({ENVIRONMENT_ERROR, TARGET_UNAVAILABLE})
-
-    RATE_LIMIT_CATEGORIES = frozenset({HTTP_429, RATE_LIMITED})
+    NON_ROUTE_SPECIFIC = frozenset(
+        {ENVIRONMENT_ERROR, TARGET_UNAVAILABLE, RATE_LIMITED, HTTP_429}
+    )
 
 
 ALL_PLATFORMS = ("youtube", "instagram", "tiktok")
@@ -516,6 +456,7 @@ def parse_proxy_string(value: str, default_scheme: str = "http") -> Optional[Pro
 
     user = match.group("user")
     pwd = match.group("password")
+    # Feature 6 (v3): Detect missing credentials when auth is implied
     requires_auth_missing = bool(user is not None and not pwd)
 
     return ProxyEntry(
@@ -639,66 +580,32 @@ def detect_format(content_type: str, url: str) -> str:
     return "txt"
 
 
-def sniff_and_parse(text: str) -> List[ParsedCandidate]:
-    """
-    Requirement #12: format-agnostic parsing. Content-sniffs a payload
-    instead of trusting a file extension - so .log, .lst, extension-less,
-    or mislabeled exports all still work. Tries JSON, then CSV-like,
-    then falls back to a plain newline-delimited list. Malformed/garbage
-    lines are silently skipped by the underlying parsers rather than
-    aborting the whole import.
-    """
-    text_stripped = text.strip()
-    if not text_stripped:
-        return []
-
-    if text_stripped[0] in "[{":
-        parsed = parse_json_payload(text)
-        if parsed:
-            return parsed
-
-    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-    if lines:
-        sample = lines[: min(25, len(lines))]
-        comma_lines = sum(1 for ln in sample if ln.count(",") >= 2)
-        if comma_lines >= max(1, len(sample) // 2):
-            parsed = parse_csv_payload(text)
-            if parsed:
-                return parsed
-
-    return parse_txt_payload(text)
-
-
 def parse_source_payload(text: str, content_type: str, url: str = "") -> List[ParsedCandidate]:
     fmt = detect_format(content_type, url)
     if fmt == "json":
         parsed = parse_json_payload(text)
         if parsed:
             return parsed
-        return sniff_and_parse(text)
+        return parse_txt_payload(text)
     if fmt == "csv":
         parsed = parse_csv_payload(text)
         if parsed:
             return parsed
-        return sniff_and_parse(text)
-    # Even for plain-text-looking sources, fall back to full content
-    # sniffing in case the extension/content-type was misleading.
-    parsed = parse_txt_payload(text)
-    if parsed:
-        return parsed
-    return sniff_and_parse(text)
+        return parse_txt_payload(text)
+    return parse_txt_payload(text)
 
 
 # ============================================================================
-# QUALITY SCORE & STAGGERED SCHEDULING
+# V4 HELPERS: QUALITY SCORE & STAGGERED SCHEDULING (Features 1 & 2)
 # ============================================================================
 
 def compute_quality_score(doc: Dict[str, Any], platform: str, reputation_penalty: int = 0) -> int:
     """
+    Feature 1: Proxy Benchmark / Quality Score.
     Blends recent success rate, average latency, and verification recency
-    into a single 0-100 score, then subtracts any reputation penalty so
-    chronically-bad proxies sink to the bottom of both the retest queue
-    (see Database.claim_proxy) and exports.
+    into a single 0-100 score, then subtracts any reputation penalty
+    (Feature 4) so chronically-bad proxies sink to the bottom of exports
+    and get lower retest priority.
     """
     p_stat = (doc.get("platform_status") or {}).get(platform, {})
     success_count = safe_int(p_stat.get("success_count", 0))
@@ -732,12 +639,9 @@ def stagger_offset_seconds(proxy_id: str, window_seconds: int) -> int:
 
 def staggered_next_check(proxy_id: str, base_interval_seconds: int, window_seconds: int) -> datetime:
     """
-    Spreads WORKING re-checks across a rolling window (default 48h) based
-    on a stable per-proxy hash offset, instead of everyone becoming due at
-    once. NOTE: this only ever applies to already-WORKING (successful)
-    proxies - quarantined/failed proxies use the separate, hard-capped
-    <=2h retry logic in Database.record_platform_result, so this window
-    can never delay a failing proxy's retest (Requirement #4/#9).
+    Feature 2: Paced / Staged Revalidation.
+    Spreads WORKING re-checks across a rolling window (default 48h) based on
+    a stable per-proxy hash offset, instead of everyone becoming due at once.
     """
     offset = stagger_offset_seconds(proxy_id, window_seconds) - (window_seconds // 2)
     seconds = max(60, base_interval_seconds + offset)
@@ -745,11 +649,11 @@ def staggered_next_check(proxy_id: str, base_interval_seconds: int, window_secon
 
 
 # ============================================================================
-# CIRCUIT BREAKER & BANDWIDTH BUDGET
+# V4 HELPERS: CIRCUIT BREAKER & BANDWIDTH BUDGET (Features 5 & 6)
 # ============================================================================
 
 class CircuitBreaker:
-    """Pauses a platform's testing when mass failure is detected."""
+    """Feature 6: pauses a platform's testing when mass failure is detected."""
 
     def __init__(self, platform: str) -> None:
         self.platform = platform
@@ -800,15 +704,9 @@ class CircuitBreaker:
                 return True
         return False
 
-    def fail_rate(self) -> float:
-        self._prune()
-        if not self.window:
-            return 0.0
-        return sum(1 for _, s in self.window if not s) / len(self.window)
-
 
 class BandwidthBudget:
-    """Caps the number of tests a platform may run per rolling window."""
+    """Feature 5: caps the number of tests a platform may run per rolling window."""
 
     def __init__(self, max_tests_per_window: int, window_seconds: int) -> None:
         self.max_tests = max_tests_per_window
@@ -834,7 +732,7 @@ class BandwidthBudget:
 
 
 # ============================================================================
-# DATABASE LAYER (Per-Platform Collections, Retention, No Migration Baggage)
+# DATABASE LAYER (Per-Platform Collections, Legacy Migration, Retention)
 # ============================================================================
 
 class Database:
@@ -842,8 +740,10 @@ class Database:
         self.client: Optional[AsyncMongoClient] = None
         self.db = None
 
-        # The ONLY proxy collections in the system now (Requirement #1).
+        # NEW active collections (used for everything going forward).
         self.cols: Dict[str, Any] = {}
+        # LEGACY read-only collections (migration source only).
+        self.legacy_cols: Dict[str, Any] = {}
 
         self.sources = None
         self.tasks = None
@@ -851,12 +751,19 @@ class Database:
         self.events = None
         self.daily = None
         self.worker_config = None
+
+        # V4 collections
+        self.migration_state = None
+        self.migration_audit_log = None
         self.reputation = None
         self.archive = None
         self.export_snapshots = None
 
     def get_col(self, platform: str):
         return self.cols.get(platform, self.cols["youtube"])
+
+    def get_legacy_col(self, platform: str):
+        return self.legacy_cols.get(platform, self.legacy_cols["youtube"])
 
     async def connect(self) -> None:
         self.client = AsyncMongoClient(
@@ -869,10 +776,18 @@ class Database:
         await self.client.admin.command("ping")
         self.db = self.client[Config.MONGO_DB_NAME]
 
+        # Legacy per-platform collections - READ-ONLY migration source, untouched.
+        self.legacy_cols = {
+            "youtube": self.db[Config.PROXY_COLLECTION_YT],
+            "instagram": self.db[Config.PROXY_COLLECTION_IG],
+            "tiktok": self.db[Config.PROXY_COLLECTION_TT],
+        }
+
+        # New, exactly-named active collections used for everything going forward.
         self.cols = {
-            "youtube": self.db[Config.COLLECTION_NAMES["youtube"]],
-            "instagram": self.db[Config.COLLECTION_NAMES["instagram"]],
-            "tiktok": self.db[Config.COLLECTION_NAMES["tiktok"]],
+            "youtube": self.db[Config.NEW_COLLECTION_NAMES["youtube"]],
+            "instagram": self.db[Config.NEW_COLLECTION_NAMES["instagram"]],
+            "tiktok": self.db[Config.NEW_COLLECTION_NAMES["tiktok"]],
         }
 
         self.sources = self.db["proxy_sources"]
@@ -881,14 +796,24 @@ class Database:
         self.events = self.db["proxy_events"]
         self.daily = self.db["proxy_daily_summary"]
         self.worker_config = self.db["worker_config"]
+
+        # V4 collections
+        self.migration_state = self.db["migration_state"]
+        self.migration_audit_log = self.db["migration_audit_log"]
         self.reputation = self.db["proxy_reputation"]
         self.archive = self.db["proxy_archive"]
         self.export_snapshots = self.db["export_snapshots"]
 
         await self.ensure_indexes()
-        logger.info("[DB] Connected. Active collections: %s", list(Config.COLLECTION_NAMES.values()))
+        logger.info(
+            "[DB] Connected. Active collections: %s | Legacy (read-only): %s",
+            list(Config.NEW_COLLECTION_NAMES.values()),
+            [Config.PROXY_COLLECTION_YT, Config.PROXY_COLLECTION_IG, Config.PROXY_COLLECTION_TT],
+        )
 
     async def ensure_indexes(self) -> None:
+        # Only the NEW active collections get index management. Legacy
+        # collections are left completely alone, as required.
         for platform, col in self.cols.items():
             try:
                 await col.create_index([("proxy_id", ASCENDING)], unique=True, sparse=True)
@@ -913,6 +838,9 @@ class Database:
         await self.tasks.create_index([("task_id", ASCENDING)], unique=True)
         await self.events.create_index([("proxy_id", ASCENDING), ("created_at", DESCENDING)])
         await self.daily.create_index([("date", ASCENDING)], unique=True)
+
+        await self.migration_state.create_index([("proxy_id", ASCENDING), ("platform", ASCENDING)], unique=True)
+        await self.migration_audit_log.create_index([("created_at", DESCENDING)])
         await self.reputation.create_index([("proxy_id", ASCENDING)], unique=True)
         await self.archive.create_index([("archived_platform", ASCENDING), ("archived_at", DESCENDING)])
         await self.export_snapshots.create_index([("platform", ASCENDING), ("created_at", DESCENDING)])
@@ -942,7 +870,7 @@ class Database:
             upsert=True,
         )
 
-    # --- Sources management ---
+    # --- Sources management (unchanged from v3) ---
 
     async def get_sources(self, enabled_only: bool = False) -> List[Dict[str, Any]]:
         query = {"enabled": True} if enabled_only else {}
@@ -999,12 +927,11 @@ class Database:
         error: Optional[str] = None,
     ) -> None:
         update: Dict[str, Any] = {"last_checked_at": now_utc(), "updated_at": now_utc()}
-        inc: Dict[str, Any] = {}
         if content_hash is not None:
             update["last_content_hash"] = content_hash
         if item_count is not None:
             update["last_item_count"] = item_count
-            inc["yield_total_discovered"] = item_count
+            update["$inc"] = {"yield_total_discovered": item_count}
         if resolved_url is not None:
             update["resolved_url"] = resolved_url
             update["resolved_at"] = now_utc()
@@ -1017,14 +944,12 @@ class Database:
             update["last_success_at"] = now_utc()
             update["last_failure_at"] = None
             update["failure_count"] = 0
-            if inc:
-                await self.sources.update_one({"source_id": source_id}, {"$set": update, "$inc": inc})
-            else:
-                await self.sources.update_one({"source_id": source_id}, {"$set": update})
+            await self.sources.update_one({"source_id": source_id}, {"$set": update})
         else:
             update["last_failure_at"] = now_utc()
             if error:
                 update["last_error"] = short_error(error)
+            inc = update.pop("$inc", {})
             inc["failure_count"] = 1
             await self.sources.update_one({"source_id": source_id}, {"$set": update, "$inc": inc})
 
@@ -1033,99 +958,82 @@ class Database:
             return
         await self.sources.update_one({"source_id": source_id}, {"$inc": {"yield_working_count": 1}})
 
-    # --- Proxy ingestion (atomic, race-free upsert) ---
-
-    @staticmethod
-    def _default_platform_status(now: datetime) -> Dict[str, Any]:
-        return {
-            "state": PlatformState.QUARANTINED,
-            "working": False,
-            "last_checked_at": None,
-            "next_check_at": now,  # eligible for immediate test
-            "quarantined_since": now,
-            "consecutive_fail_windows": 0,
-            "consecutive_429_count": 0,
-            "flap_recovery_count": 0,
-            "success_count": 0,
-            "fail_count": 0,
-            "last_error": None,
-            "last_error_category": None,
-            "last_notified_state": None,
-        }
+    # --- Proxies ingestion & state persistence across the 3 NEW collections ---
 
     async def upsert_proxy_to_platforms(
         self, entry: ProxyEntry, country: Optional[str] = None
     ) -> Tuple[bool, Dict[str, Any]]:
-        """
-        Requirement #15: atomic, idempotent upsert. Uses a single
-        `update_one(..., upsert=True)` per platform collection (rather
-        than find-then-insert) so concurrent discovery workers or
-        concurrent validation workers can never race each other into
-        creating duplicate proxy_id documents.
-        """
         now = now_utc()
         is_new_overall = False
-        sample_doc: Dict[str, Any] = {}
+        sample_doc = {}
 
         for platform, col in self.cols.items():
-            insert_doc: Dict[str, Any] = {
-                "proxy_id": entry.proxy_id,
-                "proxy_url": entry.canonical,
-                "scheme": entry.scheme,
-                "host": entry.host,
-                "port": entry.port,
-                "username": entry.username,
-                "password": entry.password,
-                "source_country": country or entry.source_country,
-                "requires_auth_missing": entry.requires_auth_missing,
-                "enabled": True,
-                "retired": False,
-                "ever_working": False,
-                "pinned": False,
-                "quality_score": 0,
-                "verified_country": None,
-                "country_name": None,
-                "latency_ms": None,
-                "first_seen_at": now,
-                "last_tested_at": None,
-                "lease_until": None,
-                "platform_status": {platform: self._default_platform_status(now)},
-            }
-
-            set_fields: Dict[str, Any] = {"last_seen_at": now, "source_present": True}
-            update_ops: Dict[str, Any] = {"$set": set_fields, "$setOnInsert": insert_doc}
-            if entry.source_id:
-                update_ops["$addToSet"] = {"source_ids": entry.source_id}
-            if country and not entry.source_id:
-                # If we somehow have country info without a source id, still
-                # try to backfill it on existing docs that lack one.
-                pass
-
-            try:
-                result = await col.update_one({"proxy_id": entry.proxy_id}, update_ops, upsert=True)
-            except Exception:
-                logger.exception("[DB] Upsert failed for proxy on %s", platform)
-                continue
-
-            if getattr(result, "upserted_id", None) is not None:
+            existing = await col.find_one({"proxy_id": entry.proxy_id})
+            if existing:
+                update: Dict[str, Any] = {
+                    "last_seen_at": now,
+                    "source_present": True,
+                    "enabled": existing.get("enabled", True),
+                }
+                if entry.source_id and entry.source_id not in (existing.get("source_ids") or []):
+                    update["source_ids"] = list(set((existing.get("source_ids") or []) + [entry.source_id]))
+                if country and not existing.get("source_country"):
+                    update["source_country"] = country
+                await col.update_one({"proxy_id": entry.proxy_id}, {"$set": update})
+                sample_doc = {**existing, **update}
+            else:
                 is_new_overall = True
-
-            doc = await col.find_one({"proxy_id": entry.proxy_id})
-            if doc:
+                doc = {
+                    "proxy_id": entry.proxy_id,
+                    "proxy_url": entry.canonical,
+                    "scheme": entry.scheme,
+                    "host": entry.host,
+                    "port": entry.port,
+                    "username": entry.username,
+                    "password": entry.password,
+                    "source_ids": [entry.source_id] if entry.source_id else [],
+                    "source_country": country or entry.source_country,
+                    "source_present": True,
+                    "requires_auth_missing": entry.requires_auth_missing,
+                    "enabled": True,
+                    "retired": False,
+                    "ever_working": False,
+                    "pinned": False,
+                    "quality_score": 0,
+                    "verified_country": None,
+                    "country_name": None,
+                    "latency_ms": None,
+                    "first_seen_at": now,
+                    "last_seen_at": now,
+                    "last_tested_at": None,
+                    "lease_until": None,
+                    "platform_status": {
+                        platform: {
+                            "state": PlatformState.QUARANTINED,
+                            "working": False,
+                            "last_checked_at": None,
+                            "next_check_at": now,  # eligible for immediate test
+                            "quarantined_since": now,
+                            "consecutive_fail_windows": 0,
+                            "flap_recovery_count": 0,
+                            "success_count": 0,
+                            "fail_count": 0,
+                            "last_error": None,
+                            "last_error_category": None,
+                            "last_notified_state": None,
+                        }
+                    },
+                }
+                await col.insert_one(doc)
                 sample_doc = doc
 
         return is_new_overall, sample_doc
 
     async def claim_proxy(self, platform: str, lease_seconds: int = 180) -> Optional[Dict[str, Any]]:
-        """
-        Requirement #8: quality_score now genuinely drives selection.
-        Pinned proxies go first, then the highest-quality/most-reliable
-        proxies among those currently due, then earliest-due as a
-        tiebreaker. `find_one_and_update` is atomic, which is what makes
-        it safe to run several concurrent workers per platform.
-        """
         now = now_utc()
         col = self.get_col(platform)
+        # Feature 8: pinned proxies are always tried first among eligible ones.
+        # Quality score prioritization: highest quality_score first, then lowest latency, then earliest next_check_at
         query = {
             "enabled": True,
             "retired": False,
@@ -1139,21 +1047,10 @@ class Database:
             sort=[
                 ("pinned", DESCENDING),
                 ("quality_score", DESCENDING),
+                ("latency_ms", ASCENDING),
                 (f"platform_status.{platform}.next_check_at", ASCENDING),
             ],
             return_document=True,
-        )
-
-    async def count_due(self, platform: str) -> int:
-        now = now_utc()
-        col = self.get_col(platform)
-        return await col.count_documents(
-            {
-                "enabled": True,
-                "retired": False,
-                f"platform_status.{platform}.state": {"$ne": PlatformState.DISABLED},
-                f"platform_status.{platform}.next_check_at": {"$lte": now},
-            }
         )
 
     async def release_lease(self, platform: str, proxy_id: str) -> None:
@@ -1170,7 +1067,7 @@ class Database:
             released += res.modified_count
         return released
 
-    # --- Persistent Reputation Memory ---
+    # --- V4: Persistent Reputation Memory (Feature 4) ---
 
     async def record_reputation(self, proxy_id: str, success: bool) -> int:
         now = now_utc()
@@ -1191,12 +1088,12 @@ class Database:
             await self.reputation.update_one({"proxy_id": proxy_id}, {"$set": {"penalty": penalty}})
         return penalty
 
-    # --- Staged Revalidation State Machine ---
+    # --- Staged Revalidation State Machine (v3 Requirement #1 + v4 staggering/reputation) ---
 
     async def record_platform_result(
         self, platform: str, proxy_id: str, result: Dict[str, Any]
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Applies the WORKING/QUARANTINED/DISABLED state machine plus scoring & staggering."""
+        """Applies the WORKING/QUARANTINED/DISABLED state machine plus v4 scoring & staggering."""
         now = now_utc()
         col = self.get_col(platform)
         doc = await col.find_one({"proxy_id": proxy_id})
@@ -1215,7 +1112,7 @@ class Database:
         category = result.get("category", FailureCategory.UNKNOWN)
         error_msg = result.get("error")
 
-        # Reputation memory persists across re-adds, keyed by proxy_id only.
+        # Feature 4: reputation memory (persists across re-adds, keyed by proxy_id only)
         penalty = await self.record_reputation(proxy_id, success)
 
         meta_update: Dict[str, Any] = {
@@ -1250,8 +1147,7 @@ class Database:
             p_update["working"] = True
             p_update["quarantined_since"] = None
             p_update["consecutive_fail_windows"] = 0
-            p_update["consecutive_429_count"] = 0
-            # Staggered scheduling instead of a flat interval, further
+            # Feature 2: staggered scheduling instead of a flat interval, further
             # stretched out for proxies with reputation baggage.
             p_update["next_check_at"] = staggered_next_check(
                 proxy_id,
@@ -1272,17 +1168,11 @@ class Database:
             p_update["working"] = False
             transition_meta["now_working"] = False
 
-            if category in FailureCategory.RATE_LIMIT_CATEGORIES:
-                # Requirement #2: NO platform-wide freeze. Only THIS proxy
-                # gets a cooldown, and it escalates only for repeat
-                # offenders on this exact proxy - every other proxy in the
-                # pool (including ones behind the same source) keeps
-                # testing normally without any interruption.
-                consec_429 = safe_int(p_stat.get("consecutive_429_count", 0)) + 1
-                p_update["consecutive_429_count"] = consec_429
-                cooldown_minutes = min(60, 5 * consec_429)
+            # Per-proxy 429/rate-limit handling: short cooldown for this proxy only, no global freeze
+            if category in (FailureCategory.HTTP_429, FailureCategory.RATE_LIMITED):
                 p_update["state"] = current_state
-                p_update["next_check_at"] = now + timedelta(minutes=cooldown_minutes)
+                # Short 5-minute cooldown for this specific proxy on 429
+                p_update["next_check_at"] = now + timedelta(minutes=5)
             elif category in FailureCategory.NON_ROUTE_SPECIFIC:
                 p_update["state"] = current_state
                 p_update["next_check_at"] = now + timedelta(minutes=15)
@@ -1291,13 +1181,10 @@ class Database:
                 p_update["quarantined_since"] = now
                 p_update["consecutive_fail_windows"] = 1
 
-                base_wait = min(Config.QUARANTINE_CHECK_INTERVAL, Config.QUARANTINE_RETEST_MAX_SECONDS)
+                base_wait = Config.QUARANTINE_CHECK_INTERVAL
                 if flap_count > 0:
-                    base_wait = max(600, int(base_wait / (1 + flap_count * 0.5)))
-                base_wait = int(base_wait * (1 + penalty / 100.0))
-                # Requirement #4/#9: HARD cap - never delayed past 2h no
-                # matter what the flap/penalty math produces.
-                base_wait = min(base_wait, Config.QUARANTINE_RETEST_MAX_SECONDS)
+                    base_wait = max(1800, int(base_wait / (1 + flap_count * 0.5)))
+                base_wait = int(base_wait * (1 + penalty / 100.0))  # Feature 4: penalty stretches the wait
                 p_update["next_check_at"] = now + timedelta(seconds=base_wait)
             elif current_state == PlatformState.QUARANTINED:
                 p_update["consecutive_fail_windows"] = consecutive_fails + 1
@@ -1309,11 +1196,10 @@ class Database:
                     p_update["next_check_at"] = None
                     transition_meta["permanently_disabled"] = True
                 else:
-                    base_wait = min(Config.QUARANTINE_CHECK_INTERVAL, Config.QUARANTINE_RETEST_MAX_SECONDS)
+                    base_wait = Config.QUARANTINE_CHECK_INTERVAL
                     if flap_count > 0:
-                        base_wait = max(600, int(base_wait / (1 + flap_count * 0.5)))
+                        base_wait = max(1800, int(base_wait / (1 + flap_count * 0.5)))
                     base_wait = int(base_wait * (1 + penalty / 100.0))
-                    base_wait = min(base_wait, Config.QUARANTINE_RETEST_MAX_SECONDS)
                     p_update["next_check_at"] = now + timedelta(seconds=base_wait)
             else:
                 p_update["state"] = PlatformState.DISABLED
@@ -1321,7 +1207,7 @@ class Database:
 
         meta_update[f"platform_status.{platform}"] = {**p_stat, **p_update}
 
-        # Recompute quality score using the freshly-merged state.
+        # Feature 1: recompute quality score using the freshly-merged state.
         temp_doc = {**doc, **meta_update}
         meta_update["quality_score"] = compute_quality_score(temp_doc, platform, reputation_penalty=penalty)
 
@@ -1359,9 +1245,14 @@ class Database:
 
     async def get_average_quality(self, platform: str) -> int:
         col = self.get_col(platform)
-        docs = await col.find({"enabled": True}, {"quality_score": 1}).to_list(length=20000)
-        scores = [safe_int(d.get("quality_score", 0)) for d in docs]
-        return int(round(sum(scores) / len(scores))) if scores else 0
+        pipeline = [
+            {"$match": {"enabled": True}},
+            {"$group": {"_id": None, "avg_quality": {"$avg": "$quality_score"}}}
+        ]
+        result = await col.aggregate(pipeline).to_list(length=1)
+        if result:
+            return int(round(result[0].get("avg_quality", 0)))
+        return 0
 
     async def count_pinned(self, platform: str) -> int:
         return await self.get_col(platform).count_documents({"pinned": True})
@@ -1395,7 +1286,7 @@ class Database:
                 {"$set": {"source_present": False, "source_missing_since": now}},
             )
 
-    # --- Manual Pin / Priority Override ---
+    # --- V4: Manual Pin / Priority Override (Feature 8) ---
 
     async def set_pinned(self, platform: str, proxy_id_prefix: str, pinned: bool) -> Optional[str]:
         col = self.get_col(platform)
@@ -1405,7 +1296,7 @@ class Database:
         await col.update_one({"_id": doc["_id"]}, {"$set": {"pinned": pinned}})
         return doc["proxy_id"]
 
-    # --- Automatic Pruning of Dead Weight (archive, never hard-delete without archiving) ---
+    # --- V4: Automatic Pruning of Dead Weight (Feature 7) ---
 
     async def prune_dead_weight(self) -> Dict[str, int]:
         cutoff_seconds = Config.PRUNE_DISABLED_AFTER_SECONDS
@@ -1432,7 +1323,7 @@ class Database:
             result[platform] = archived
         return result
 
-    # --- Cross-Platform Reuse Check (queue-only, never auto-verifies) ---
+    # --- V4: Cross-Platform Reuse Check (Feature 3) ---
 
     async def enqueue_cross_platform_check(self, doc: Dict[str, Any], source_platform: str) -> None:
         if not Config.CROSS_PLATFORM_REUSE_ENABLED:
@@ -1451,16 +1342,14 @@ class Database:
             col = self.cols[other]
             existing = await col.find_one({"proxy_id": proxy_id})
             if existing:
-                # Already known on this platform - just bump it to the front
-                # of ITS OWN queue. It still has to pass ITS OWN validator
-                # to ever be marked working there (Requirement #9).
+                # Already known on this platform - just bump it to the front of the queue.
                 await col.update_one(
                     {"proxy_id": proxy_id},
                     {"$set": {f"platform_status.{other}.next_check_at": now}},
                 )
                 continue
 
-            insert_doc = {
+            new_doc = {
                 "proxy_id": proxy_id,
                 "proxy_url": doc.get("proxy_url"),
                 "scheme": scheme,
@@ -1468,6 +1357,7 @@ class Database:
                 "port": port,
                 "username": doc.get("username"),
                 "password": doc.get("password"),
+                "source_ids": doc.get("source_ids", []),
                 "source_country": doc.get("source_country"),
                 "source_present": True,
                 "requires_auth_missing": doc.get("requires_auth_missing", False),
@@ -1483,17 +1373,29 @@ class Database:
                 "last_seen_at": now,
                 "last_tested_at": None,
                 "lease_until": None,
-                "platform_status": {other: self._default_platform_status(now)},
+                "platform_status": {
+                    other: {
+                        "state": PlatformState.QUARANTINED,
+                        "working": False,
+                        "last_checked_at": None,
+                        "next_check_at": now,  # promising candidate - test soon
+                        "quarantined_since": now,
+                        "consecutive_fail_windows": 0,
+                        "flap_recovery_count": 0,
+                        "success_count": 0,
+                        "fail_count": 0,
+                        "last_error": None,
+                        "last_error_category": None,
+                        "last_notified_state": None,
+                    }
+                },
             }
-            update_ops: Dict[str, Any] = {"$setOnInsert": insert_doc}
-            if doc.get("source_ids"):
-                update_ops["$addToSet"] = {"source_ids": doc["source_ids"][0]}
             try:
-                await col.update_one({"proxy_id": proxy_id}, update_ops, upsert=True)
+                await col.insert_one(new_doc)
             except Exception:
                 pass  # benign race with a concurrent insert; safe to ignore
 
-    # --- Snapshot Export History ---
+    # --- V4: Snapshot Export History (Feature 9) ---
 
     async def save_export_snapshot(self, platform: str, proxy_ids: List[str]) -> Dict[str, Any]:
         prev = await self.export_snapshots.find_one({"platform": platform}, sort=[("created_at", DESCENDING)])
@@ -1506,40 +1408,43 @@ class Database:
         )
         return {"added": len(added), "removed": len(removed), "total": len(cur_ids)}
 
+    # --- V4: Legacy migration helpers (Requirement #3) ---
+
+    async def legacy_tagged_working(self, platform: str) -> List[Dict[str, Any]]:
+        """Every proxy in the OLD collection tagged as working for this platform."""
+        col = self.legacy_cols.get(platform)
+        if col is None:
+            return []
+        query = {"$or": [{"ever_working": True}, {f"platform_status.{platform}.state": PlatformState.WORKING}]}
+        return await col.find(query).to_list(length=20000)
+
+    async def is_migrated(self, proxy_id: str, platform: str) -> bool:
+        doc = await self.migration_state.find_one({"proxy_id": proxy_id, "platform": platform})
+        return bool(doc and doc.get("status") in ("migrated", "duplicate"))
+
+    async def mark_migrated(self, proxy_id: str, platform: str, status: str) -> None:
+        await self.migration_state.update_one(
+            {"proxy_id": proxy_id, "platform": platform},
+            {"$set": {"status": status, "updated_at": now_utc()}, "$setOnInsert": {"created_at": now_utc()}},
+            upsert=True,
+        )
+
+    async def log_migration_audit(
+        self, platform: str, action: str, admin_id: Optional[int], counts: Dict[str, Any]
+    ) -> None:
+        await self.migration_audit_log.insert_one(
+            {"platform": platform, "action": action, "admin_id": admin_id, "counts": counts, "created_at": now_utc()}
+        )
+
+    async def get_migration_audit_log(self, limit: int = 15) -> List[Dict[str, Any]]:
+        return await self.migration_audit_log.find({}).sort("created_at", DESCENDING).to_list(length=limit)
+
 
 # ============================================================================
-# VALIDATORS & PLUGIN ARCHITECTURE
+# VALIDATORS & PLUGIN ARCHITECTURE (unchanged from v3)
 # ============================================================================
-
-def modern_browser_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    """Requirement #3: realistic, current browser fingerprint for HTTP validators."""
-    headers = {
-        "User-Agent": Config.USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-        "Connection": "keep-alive",
-    }
-    if extra:
-        headers.update(extra)
-    return headers
-
 
 class BaseValidator:
-    """
-    NOTE (Requirement #2): there is intentionally NO platform-wide backoff
-    state on this class anymore. A validator instance is shared by every
-    concurrent worker testing that platform, so any "pause the validator"
-    flag here would freeze the ENTIRE platform for every proxy at once -
-    exactly the bug we removed. Per-proxy cooldowns live in
-    Database.record_platform_result() instead, keyed by proxy_id.
-    """
-
     def __init__(self, platform: str, test_urls: Tuple[str, ...], timeout_seconds: int):
         self.platform = platform
         self.test_urls = test_urls
@@ -1680,7 +1585,6 @@ class GenericHTTPValidator(BaseValidator):
         started = time.monotonic()
         proxy_url = entry.canonical
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
-        headers = modern_browser_headers()
 
         if entry.scheme.startswith("socks") and ProxyConnector is None:
             return {
@@ -1692,9 +1596,11 @@ class GenericHTTPValidator(BaseValidator):
         try:
             if entry.scheme.startswith("socks"):
                 connector = ProxyConnector.from_url(proxy_url)
-                session_ctx = aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers)
+                session_ctx = aiohttp.ClientSession(
+                    connector=connector, timeout=timeout, headers={"User-Agent": Config.USER_AGENT}
+                )
             else:
-                session_ctx = aiohttp.ClientSession(timeout=timeout, headers=headers)
+                session_ctx = aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": Config.USER_AGENT})
 
             async with session_ctx as session:
                 kwargs = {} if entry.scheme.startswith("socks") else {"proxy": proxy_url}
@@ -1753,131 +1659,12 @@ class GenericHTTPValidator(BaseValidator):
             }
 
 
-class TikTokValidator(BaseValidator):
-    """
-    Requirement #3: dedicated TikTok validator. Uses a modern browser
-    fingerprint, follows redirects, and inspects the response BODY (not
-    just the status code) for TikTok's soft-block / verification-wall
-    pages, which frequently come back as a plain HTTP 200 rather than a
-    hard error - a common source of false negatives/positives in naive
-    status-code-only checks.
-    """
-
-    _CHALLENGE_MARKERS = (
-        "verify to continue",
-        "captcha",
-        "punish_control",
-        "/captcha/",
-        "secsdk-captcha",
-        "verify you are human",
-    )
-
-    def __init__(self):
-        super().__init__("tiktok", Config.TIKTOK_TEST_URLS, Config.TIKTOK_TIMEOUT)
-
-    async def test(self, entry: ProxyEntry) -> Dict[str, Any]:
-        target_url = self.pick_target_url()
-        started = time.monotonic()
-        proxy_url = entry.canonical
-        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
-        headers = modern_browser_headers({"Referer": "https://www.tiktok.com/"})
-
-        if entry.scheme.startswith("socks") and ProxyConnector is None:
-            return {
-                "ok": False,
-                "category": FailureCategory.ENVIRONMENT_ERROR,
-                "error": "aiohttp-socks is required for SOCKS validation",
-            }
-
-        try:
-            if entry.scheme.startswith("socks"):
-                connector = ProxyConnector.from_url(proxy_url)
-                session_ctx = aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers)
-            else:
-                session_ctx = aiohttp.ClientSession(timeout=timeout, headers=headers)
-
-            async with session_ctx as session:
-                kwargs = {} if entry.scheme.startswith("socks") else {"proxy": proxy_url}
-                async with session.get(target_url, allow_redirects=True, max_redirects=5, **kwargs) as resp:
-                    duration = time.monotonic() - started
-                    final_url = str(resp.url).lower()
-
-                    if resp.status == 429:
-                        return {
-                            "ok": False,
-                            "category": FailureCategory.HTTP_429,
-                            "error": "HTTP 429 Too Many Requests",
-                            "latency_ms": round(duration * 1000.0, 1),
-                        }
-                    if resp.status == 403:
-                        return {
-                            "ok": False,
-                            "category": FailureCategory.HTTP_403,
-                            "error": "HTTP 403 Forbidden",
-                            "latency_ms": round(duration * 1000.0, 1),
-                        }
-
-                    body_sample = ""
-                    if resp.status < 400:
-                        try:
-                            body_sample = (await resp.text(errors="replace"))[:20000].lower()
-                        except Exception:
-                            body_sample = ""
-
-                    if "/verify" in final_url or any(marker in body_sample for marker in self._CHALLENGE_MARKERS):
-                        return {
-                            "ok": False,
-                            "category": FailureCategory.RATE_LIMITED,
-                            "error": "TikTok verification/captcha wall detected",
-                            "latency_ms": round(duration * 1000.0, 1),
-                        }
-
-                    if resp.status < 400:
-                        return {
-                            "ok": True,
-                            "category": FailureCategory.SUCCESS,
-                            "latency_ms": round(duration * 1000.0, 1),
-                        }
-
-                    return {
-                        "ok": False,
-                        "category": FailureCategory.TARGET_UNAVAILABLE,
-                        "error": f"HTTP {resp.status}",
-                        "latency_ms": round(duration * 1000.0, 1),
-                    }
-        except asyncio.TimeoutError:
-            return {
-                "ok": False,
-                "category": FailureCategory.CONNECTION_TIMEOUT,
-                "error": "HTTP connect timeout",
-                "latency_ms": round((time.monotonic() - started) * 1000.0, 1),
-            }
-        except Exception as exc:
-            text = str(exc).lower()
-            if "407" in text or "auth" in text:
-                cat = FailureCategory.AUTH_MISSING if entry.requires_auth_missing else FailureCategory.PROXY_AUTH_FAILURE
-            elif "ssl" in text or "cert" in text:
-                cat = FailureCategory.TLS_ERROR
-            elif "refused" in text:
-                cat = FailureCategory.CONNECTION_REFUSED
-            elif "getaddrinfo" in text:
-                cat = FailureCategory.DNS_FAILURE
-            else:
-                cat = FailureCategory.PROXY_PROTOCOL_FAILURE
-            return {
-                "ok": False,
-                "category": cat,
-                "error": short_error(exc),
-                "latency_ms": round((time.monotonic() - started) * 1000.0, 1),
-            }
-
-
 class ValidationEngine:
     def __init__(self) -> None:
         self.validators: Dict[str, BaseValidator] = {
             "youtube": YouTubeValidator(),
             "instagram": GenericHTTPValidator("instagram", Config.INSTAGRAM_TEST_URLS, Config.INSTAGRAM_TIMEOUT),
-            "tiktok": TikTokValidator(),
+            "tiktok": GenericHTTPValidator("tiktok", Config.TIKTOK_TEST_URLS, Config.TIKTOK_TIMEOUT),
         }
 
     @staticmethod
@@ -1919,6 +1706,10 @@ class ValidationEngine:
             if not ip:
                 return {}
 
+            if "{ip}" not in Config.GEO_LOOKUP_URL:
+                logger.error("GEO_LOOKUP_URL must contain {ip} placeholder")
+                return {}
+
             geo_url = Config.GEO_LOOKUP_URL.replace("{ip}", quote(ip, safe=""))
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=Config.GEO_TIMEOUT)) as s:
                 async with s.get(geo_url) as gr:
@@ -1943,10 +1734,6 @@ class ValidationEngine:
             requires_auth_missing=proxy_doc.get("requires_auth_missing", False),
         )
 
-        # Early failure detection (Requirement #16): a plain TCP dial to
-        # the proxy port is far cheaper than a full platform request, so
-        # dead proxies are rejected almost instantly without spending any
-        # of the platform's bandwidth budget on a doomed HTTP/yt-dlp call.
         reachable = await self.tcp_connect_check(entry)
         if not reachable:
             return {
@@ -1968,7 +1755,7 @@ class ValidationEngine:
 
 
 # ============================================================================
-# SOURCE MANAGER & AUTO-DISCOVERY (now concurrent, non-blocking)
+# SOURCE MANAGER & AUTO-DISCOVERY (unchanged from v3)
 # ============================================================================
 
 class ProxySourceManager:
@@ -2138,80 +1925,61 @@ class ProxySourceManager:
         return {"source_id": source_id, "unchanged": False, "added": new_count, "total": len(known_ids)}
 
     async def run_discovery_pass(self) -> int:
-        """
-        Requirement #5/#9/#10: crawls known GitHub-tree sources for new
-        proxy list FILES concurrently (bounded by
-        DISCOVERY_FETCH_CONCURRENCY) instead of one at a time, so a slow
-        or unreachable repo can't stall discovery of the rest.
-        """
         sources = await self.db.get_sources(enabled_only=True)
-        github_sources = [s for s in sources if self._is_github_repo_url(str(s.get("url", "")))]
-        if not github_sources:
-            return 0
+        discovered_count = 0
 
-        sem = asyncio.Semaphore(Config.DISCOVERY_FETCH_CONCURRENCY)
-        discovered_total = 0
-        lock = asyncio.Lock()
-
-        async def process(src: Dict[str, Any]) -> None:
-            nonlocal discovered_total
+        for src in sources:
             url = str(src.get("url", ""))
+            if not self._is_github_repo_url(url):
+                continue
+
             parsed = urlparse(url)
             parts = [unquote(x) for x in parsed.path.split("/") if x]
             if len(parts) < 4:
-                return
+                continue
 
             owner, repo = parts[0], parts[1]
             branch = parts[3] if len(parts) >= 4 and parts[2] in ("tree", "blob") else "main"
             path = "/".join(parts[4:-1]) if len(parts) >= 5 else ""
 
-            async with sem:
-                try:
-                    entries = await self._list_github_directory(owner, repo, branch, path)
-                except Exception:
-                    return
+            try:
+                entries = await self._list_github_directory(owner, repo, branch, path)
+                for item in entries:
+                    if item.get("type") != "file":
+                        continue
+                    fname = str(item.get("name", "")).lower()
+                    if not any(fname.endswith(f".{ext}") for ext in ("txt", "json", "csv")):
+                        continue
+                    if not any(k in fname for k in ("proxy", "proxies", "http", "socks", "list")):
+                        continue
 
-            found_here = 0
-            for item in entries:
-                if item.get("type") != "file":
-                    continue
-                fname = str(item.get("name", "")).lower()
-                if not any(fname.endswith(f".{ext}") for ext in ("txt", "json", "csv")):
-                    continue
-                if not any(k in fname for k in ("proxy", "proxies", "http", "socks", "list")):
-                    continue
+                    raw_download = item.get("download_url")
+                    if not raw_download:
+                        continue
 
-                raw_download = item.get("download_url")
-                if not raw_download:
-                    continue
-
-                cand_id = hashlib.sha1(raw_download.encode()).hexdigest()[:16]
-                exists = await self.db.get_source(cand_id)
-                if not exists:
-                    await self.db.upsert_source(
-                        {
-                            "source_id": cand_id,
-                            "name": f"Auto: {repo}/{item.get('name')}",
-                            "url": raw_download,
-                            "enabled": True,
-                            "discovered": True,
-                            "priority": 50,
-                            "fetch_interval": Config.SOURCE_REFRESH_SECONDS * 2,
-                        },
-                        only_if_missing=True,
-                    )
-                    found_here += 1
-
-            if found_here:
-                async with lock:
-                    discovered_total += found_here
-
-        await asyncio.gather(*(process(src) for src in github_sources))
-        return discovered_total
+                    cand_id = hashlib.sha1(raw_download.encode()).hexdigest()[:16]
+                    exists = await self.db.get_source(cand_id)
+                    if not exists:
+                        await self.db.upsert_source(
+                            {
+                                "source_id": cand_id,
+                                "name": f"Auto: {repo}/{item.get('name')}",
+                                "url": raw_download,
+                                "enabled": True,
+                                "discovered": True,
+                                "priority": 50,
+                                "fetch_interval": Config.SOURCE_REFRESH_SECONDS * 2,
+                            },
+                            only_if_missing=True,
+                        )
+                        discovered_count += 1
+            except Exception:
+                pass
+        return discovered_count
 
 
 # ============================================================================
-# SCHEDULER & DISPATCHER (adaptive multi-worker pools per platform)
+# SCHEDULER & DISPATCHER
 # ============================================================================
 
 class WorkerScheduler:
@@ -2232,21 +2000,14 @@ class WorkerScheduler:
         self.pause_event = asyncio.Event()
         self.pause_event.set()  # set = running; clear = paused
 
-        # Global concurrency cap shared across ALL platform workers.
         self.semaphore = asyncio.Semaphore(Config.TEST_CONCURRENCY)
         self.active_tests = 0
-
-        # Requirement #3/#11: instead of a single sequential dispatch loop
-        # per platform, each platform runs a small POOL of worker
-        # coroutines whose size is adjusted live based on backlog and
-        # health, so the engine "immediately rotates to the next
-        # available proxy" instead of stalling on one test at a time.
-        self.worker_tasks: Dict[str, List[asyncio.Task]] = {p: [] for p in ALL_PLATFORMS}
-        self.controller_task: Optional[asyncio.Task] = None
+        self.platform_tasks: List[asyncio.Task] = []
         self.periodic_task: Optional[asyncio.Task] = None
         self.discovery_task: Optional[asyncio.Task] = None
         self.prune_task: Optional[asyncio.Task] = None
 
+        # V4: per-platform circuit breakers and bandwidth budgets.
         self.breakers: Dict[str, CircuitBreaker] = {p: CircuitBreaker(p) for p in ALL_PLATFORMS}
         self.bandwidth: Dict[str, BandwidthBudget] = {
             p: BandwidthBudget(Config.PER_PLATFORM_TEST_BUDGET, Config.BANDWIDTH_BUDGET_WINDOW_SECONDS)
@@ -2258,32 +2019,31 @@ class WorkerScheduler:
         self.stop_event.clear()
         self.pause_event.set()
 
-        for platform in ALL_PLATFORMS:
-            self._spawn_worker(platform)
+        for plat in ALL_PLATFORMS:
+            t = asyncio.create_task(self.platform_dispatch_loop(plat), name=f"dispatcher-{plat}")
+            self.platform_tasks.append(t)
 
-        self.controller_task = asyncio.create_task(self.concurrency_controller_loop(), name="scheduler-controller")
         self.periodic_task = asyncio.create_task(self.periodic_scheduler_loop(), name="scheduler-periodic")
         self.discovery_task = asyncio.create_task(self.discovery_scheduler_loop(), name="scheduler-discovery")
         self.prune_task = asyncio.create_task(self.prune_scheduler_loop(), name="scheduler-prune")
-        logger.info("[SCHEDULER] Adaptive worker pools and scheduler loops initialized.")
+        logger.info("[SCHEDULER] All platform dispatchers and scheduler loops initialized.")
 
     async def stop(self) -> None:
         self.running = False
         self.stop_event.set()
         self.pause_event.set()
 
-        all_tasks: List[asyncio.Task] = []
-        for tasks in self.worker_tasks.values():
-            all_tasks.extend(tasks)
-        for t in all_tasks:
+        for t in self.platform_tasks:
             t.cancel()
-        for t in (self.controller_task, self.periodic_task, self.discovery_task, self.prune_task):
-            if t:
-                t.cancel()
+        if self.periodic_task:
+            self.periodic_task.cancel()
+        if self.discovery_task:
+            self.discovery_task.cancel()
+        if self.prune_task:
+            self.prune_task.cancel()
 
         await asyncio.gather(
-            *all_tasks,
-            self.controller_task,
+            *self.platform_tasks,
             self.periodic_task,
             self.discovery_task,
             self.prune_task,
@@ -2291,63 +2051,8 @@ class WorkerScheduler:
         )
         logger.info("[SCHEDULER] All tasks successfully stopped.")
 
-    # --- Adaptive worker pool management (Requirement #11) ---
-
-    def _spawn_worker(self, platform: str) -> None:
-        idx = len(self.worker_tasks[platform])
-        t = asyncio.create_task(self._worker_loop(platform), name=f"worker-{platform}-{idx}")
-        self.worker_tasks[platform].append(t)
-
-    async def _compute_desired_workers(self, platform: str) -> int:
-        breaker = self.breakers[platform]
-        if breaker.state == "OPEN":
-            return 0  # avoid wasting bandwidth hammering a route that's actively blocking us
-
-        try:
-            backlog = await self.db.count_due(platform)
-        except Exception:
-            backlog = 0
-
-        if backlog <= 0:
-            return 1  # keep one idle poller so newly-due proxies get picked up promptly
-
-        fail_rate = breaker.fail_rate()
-        desired = 1 + backlog // 15
-        if fail_rate > 0.5:
-            # Don't blindly throw more concurrency at a platform that's
-            # mostly failing right now - back off instead of wasting
-            # bandwidth (Requirement #11/#16).
-            desired = max(1, desired // 2)
-        return max(1, min(Config.MAX_WORKERS_PER_PLATFORM, desired))
-
-    async def concurrency_controller_loop(self) -> None:
-        while not self.stop_event.is_set():
-            try:
-                await asyncio.sleep(Config.CONTROLLER_INTERVAL_SECONDS)
-                for platform in ALL_PLATFORMS:
-                    desired = await self._compute_desired_workers(platform)
-                    current = [t for t in self.worker_tasks[platform] if not t.done()]
-                    self.worker_tasks[platform] = current
-
-                    if len(current) < desired:
-                        for _ in range(desired - len(current)):
-                            self._spawn_worker(platform)
-                    elif len(current) > desired:
-                        extras = current[desired:]
-                        for t in extras:
-                            t.cancel()
-                        self.worker_tasks[platform] = current[:desired]
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception("[SCHEDULER] Error in concurrency controller loop")
-
-    async def _worker_loop(self, platform: str) -> None:
-        """One concurrent validation worker for a single platform. Several
-        of these run at once per platform (see concurrency_controller_loop),
-        each independently claiming and testing proxies, so a slow test on
-        one proxy never blocks the others from rotating through the pool
-        (Requirement #3)."""
+    async def platform_dispatch_loop(self, platform: str) -> None:
+        """Drains the next eligible proxies for this specific platform."""
         breaker = self.breakers[platform]
         budget = self.bandwidth[platform]
 
@@ -2359,10 +2064,12 @@ class WorkerScheduler:
                 await asyncio.sleep(5)
                 continue
 
+            # Feature 6: Circuit breaker guard.
             if not breaker.allow_request():
                 await asyncio.sleep(5)
                 continue
 
+            # Feature 5: Bandwidth budget guard (now actually enforced).
             if not budget.try_consume():
                 await asyncio.sleep(min(30, max(1, budget.seconds_until_reset())))
                 continue
@@ -2392,12 +2099,10 @@ class WorkerScheduler:
 
                     await self._handle_platform_notification(platform, updated, meta)
 
+                    # Feature 3: cross-platform reuse check.
                     if meta.get("now_working"):
                         await self.db.enqueue_cross_platform_check(updated, platform)
 
-                except asyncio.CancelledError:
-                    await self.db.release_lease(platform, doc["proxy_id"])
-                    raise
                 except Exception:
                     logger.exception("[DISPATCH] Test task failed for %s on %s", str(doc.get("proxy_id", ""))[:8], platform)
                     await self.db.release_lease(platform, doc["proxy_id"])
@@ -2433,149 +2138,69 @@ class WorkerScheduler:
         ]
         await self.notify_func(platform, "\n".join(lines))
 
-    # --- Manual all-platform priority checking flow (unchanged behavior; global TXT upload) ---
+    # --- Manual Priority Checking Flow (unchanged from v3, still writes to NEW collections) ---
 
     async def manual_priority_check(self, proxies_raw: List[str]) -> str:
         self.pause_event.clear()
         logger.info("[PRIORITY] Background dequeuing paused for manual priority check (%s proxies).", len(proxies_raw))
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.5)
 
-        sem = asyncio.Semaphore(Config.ADHOC_TEST_CONCURRENCY)
-        results_summary: List[Optional[str]] = [None] * len(proxies_raw)
-
-        async def handle_one(idx: int, raw: str) -> None:
-            entry = parse_proxy_string(raw)
-            if not entry:
-                results_summary[idx] = f"❌ `{short_error(raw, 60)}` — Invalid proxy string format"
-                return
-
-            await self.db.upsert_proxy_to_platforms(entry, country=entry.source_country)
-
-            async def test_plat(p: str):
-                doc = await self.db.get_col(p).find_one({"proxy_id": entry.proxy_id})
-                res = await self.engine.validate(doc, p)
-                updated, meta = await self.db.record_platform_result(p, entry.proxy_id, res)
-                await self._handle_platform_notification(p, updated, meta)
-                if meta.get("now_working"):
-                    await self.db.enqueue_cross_platform_check(updated, p)
-                return p, res
-
-            plat_results = await asyncio.gather(*(test_plat(p) for p in ALL_PLATFORMS), return_exceptions=True)
-
-            working_on: List[str] = []
-            failures: List[str] = []
-            for r in plat_results:
-                if isinstance(r, tuple):
-                    pname, res = r
-                    if res.get("ok"):
-                        working_on.append(pname.title())
-                    else:
-                        failures.append(f"{pname.title()}: {res.get('error', 'failed')}")
-
-            proxy_masked = mask_proxy_string(entry.canonical)
-            if working_on:
-                msg = f"✅ `{proxy_masked}` — Working on: {', '.join(working_on)}"
-                if failures:
-                    msg += f" (Failed: {'; '.join(failures)})"
-            else:
-                msg = f"❌ `{proxy_masked}` — Not working on any platform:\n  " + "\n  ".join(failures)
-            results_summary[idx] = msg
-
-        async def bounded(idx: int, raw: str) -> None:
-            async with sem:
-                await handle_one(idx, raw)
+        results_summary = []
+        valid_count = 0
 
         try:
-            await asyncio.gather(*(bounded(i, raw) for i, raw in enumerate(proxies_raw)))
+            for raw in proxies_raw[:10]:
+                entry = parse_proxy_string(raw)
+                if not entry:
+                    results_summary.append(f"❌ `{raw}` — Invalid proxy string format")
+                    continue
+
+                valid_count += 1
+                await self.db.upsert_proxy_to_platforms(entry, country=entry.source_country)
+
+                async def test_plat(p: str):
+                    doc = await self.db.get_col(p).find_one({"proxy_id": entry.proxy_id})
+                    res = await self.engine.validate(doc, p)
+                    updated, meta = await self.db.record_platform_result(p, entry.proxy_id, res)
+                    await self._handle_platform_notification(p, updated, meta)
+                    if meta.get("now_working"):
+                        await self.db.enqueue_cross_platform_check(updated, p)
+                    return p, res
+
+                tasks = [test_plat(p) for p in ALL_PLATFORMS]
+                plat_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                working_on = []
+                failures = []
+
+                for r in plat_results:
+                    if isinstance(r, tuple):
+                        pname, res = r
+                        if res.get("ok"):
+                            working_on.append(pname.title())
+                        else:
+                            failures.append(f"{pname.title()}: {res.get('error', 'failed')}")
+
+                proxy_masked = mask_proxy_string(entry.canonical)
+                if working_on:
+                    msg = f"✅ `{proxy_masked}` — Working on: {', '.join(working_on)}"
+                    if failures:
+                        msg += f" (Failed: {'; '.join(failures)})"
+                    results_summary.append(msg)
+                else:
+                    msg = f"❌ `{proxy_masked}` — Not working on any platform:\n  " + "\n  ".join(failures)
+                    results_summary.append(msg)
+
         finally:
             self.pause_event.set()
             logger.info("[PRIORITY] Manual priority check completed. Background dequeuing resumed.")
 
-        return "\n\n".join(r for r in results_summary if r) or "No valid proxies parsed."
+        return "\n\n".join(results_summary) or "No valid proxies parsed."
 
-    # --- Requirement #6: per-platform "Add File" fast-track flow ---
-
-    async def platform_priority_check(
-        self,
-        platform: str,
-        proxies_raw: List[str],
-        progress_cb: Optional[Callable[[Dict[str, int], List[str], int], Any]] = None,
-    ) -> str:
-        """
-        Tests a batch of proxies against ONE platform only, streaming
-        progress via `progress_cb(counts, recent_working_lines, total)`.
-        Used by the per-platform "📥 Add File" button.
-        """
-        self.pause_event.clear()
-        total = len(proxies_raw)
-        counts = {"working": 0, "failed": 0, "invalid": 0, "done": 0}
-        detail_lines: List[str] = []
-        sem = asyncio.Semaphore(Config.ADHOC_TEST_CONCURRENCY)
-        lock = asyncio.Lock()
-        last_update = time.monotonic()
-
-        async def maybe_emit(force: bool = False) -> None:
-            nonlocal last_update
-            if not progress_cb:
-                return
-            now_m = time.monotonic()
-            if force or now_m - last_update > 2.0:
-                last_update = now_m
-                try:
-                    await progress_cb(dict(counts), list(detail_lines[-8:]), total)
-                except Exception:
-                    logger.exception("[ADDFILE] progress callback failed")
-
-        async def handle_one(raw: str) -> None:
-            entry = parse_proxy_string(raw)
-            if not entry:
-                async with lock:
-                    counts["invalid"] += 1
-                    counts["done"] += 1
-                await maybe_emit()
-                return
-
-            await self.db.upsert_proxy_to_platforms(entry, country=entry.source_country)
-            async with sem:
-                doc = await self.db.get_col(platform).find_one({"proxy_id": entry.proxy_id})
-                res = await self.engine.validate(doc, platform)
-
-            updated, meta = await self.db.record_platform_result(platform, entry.proxy_id, res)
-            await self._handle_platform_notification(platform, updated, meta)
-            if meta.get("now_working"):
-                await self.db.enqueue_cross_platform_check(updated, platform)
-
-            async with lock:
-                counts["done"] += 1
-                if res.get("ok"):
-                    counts["working"] += 1
-                    latency = updated.get("latency_ms") or 0
-                    score = updated.get("quality_score", 0)
-                    detail_lines.append(
-                        f"✅ {mask_proxy_string(entry.canonical)} — {safe_float(latency):.0f}ms — score {score}/100"
-                    )
-                else:
-                    counts["failed"] += 1
-            await maybe_emit()
-
-        try:
-            await asyncio.gather(*(handle_one(raw) for raw in proxies_raw))
-            await maybe_emit(force=True)
-        finally:
-            self.pause_event.set()
-
-        return (
-            f"📥 Add File — {platform.title()} fast-track complete\n"
-            f"Total: {total} | ✅ Working: {counts['working']} | "
-            f"❌ Failed: {counts['failed']} | ⚠️ Invalid: {counts['invalid']}"
-        )
-
-    # --- Periodic maintenance & source refresh loops (now concurrent) ---
+    # --- Periodic maintenance & source refresh loops ---
 
     async def periodic_scheduler_loop(self) -> None:
         first_run = True
-        sem = asyncio.Semaphore(Config.SOURCE_FETCH_CONCURRENCY)
-
         while not self.stop_event.is_set():
             try:
                 if first_run:
@@ -2584,30 +2209,18 @@ class WorkerScheduler:
                     await asyncio.sleep(Config.SOURCE_REFRESH_SECONDS)
 
                 sources = await self.db.get_sources(enabled_only=True)
-                due_sources = []
                 for src in sources:
                     interval = safe_int(src.get("fetch_interval"), Config.SOURCE_REFRESH_SECONDS)
                     last_checked = parse_dt(src.get("last_checked_at"))
                     if last_checked and (now_utc() - last_checked).total_seconds() < interval:
                         continue
-                    due_sources.append(src)
 
-                async def process_source(src: Dict[str, Any]) -> None:
-                    async with sem:
-                        try:
-                            res = await self.sources.import_source(src)
-                            if not res.get("unchanged"):
-                                logger.info(
-                                    "[SOURCE] Ingested %s (New: %s, Total: %s)",
-                                    src["name"], res.get("added"), res.get("total"),
-                                )
-                        except Exception as e:
-                            logger.error("[SOURCE] Ingestion error on %s: %s", src.get("name"), short_error(e))
-
-                if due_sources:
-                    # Requirement #5/#10: many sources refreshed concurrently,
-                    # in the background, without blocking validation workers.
-                    await asyncio.gather(*(process_source(s) for s in due_sources))
+                    try:
+                        res = await self.sources.import_source(src)
+                        if not res.get("unchanged"):
+                            logger.info("[SOURCE] Ingested %s (New: %s, Total: %s)", src['name'], res.get('added'), res.get('total'))
+                    except Exception as e:
+                        logger.error("[SOURCE] Ingestion error on %s: %s", src.get('name'), short_error(e))
 
                 await self.db.release_expired_leases()
                 await self.db.retire_orphans()
@@ -2624,13 +2237,14 @@ class WorkerScheduler:
                 await asyncio.sleep(Config.DISCOVERY_INTERVAL_SECONDS)
                 added = await self.sources.run_discovery_pass()
                 if added > 0:
-                    logger.info("[DISCOVERY] Auto-discovered %s new proxy sources.", added)
+                    logger.info("[DISCOVERY] Auto-discovered %s new proxy sources from GitHub trees.", added)
             except asyncio.CancelledError:
                 break
             except Exception:
                 logger.exception("[DISCOVERY] Error in auto-discovery loop")
 
     async def prune_scheduler_loop(self) -> None:
+        """Feature 7: Automatic Pruning of Dead Weight."""
         while not self.stop_event.is_set():
             try:
                 await asyncio.sleep(Config.PRUNE_CHECK_INTERVAL_SECONDS)
@@ -2658,7 +2272,7 @@ class ReportEngine:
         self.scheduler: Optional[WorkerScheduler] = None  # wired in later by Application
 
     async def export_working(self, platform: str) -> Tuple[bytes, Dict[str, Any]]:
-        """Latency/quality-ranked export + geo-diversity guard + snapshot diffing."""
+        """Latency/quality-ranked export + geo-diversity guard + Feature 9 snapshot diffing."""
         col = self.db.get_col(platform)
         cursor = col.find(
             {f"platform_status.{platform}.state": PlatformState.WORKING, "enabled": True}
@@ -2691,21 +2305,18 @@ class ReportEngine:
             pinned = await self.db.count_pinned(p)
             archived = await self.db.count_archived(p)
             breaker_state = self.scheduler.breakers[p].state if self.scheduler else "N/A"
-            workers = len(self.scheduler.worker_tasks[p]) if self.scheduler else 0
             lines.append(f"• **{p.title()}**:")
             lines.append(f"   🟢 Working: {stats['working']}")
             lines.append(f"   🟠 Quarantined: {stats['quarantined']}")
             lines.append(f"   🔴 Disabled: {stats['disabled']}")
             lines.append(f"   🌐 Total Pool: {stats['total']}")
             lines.append(f"   ⭐ Avg Quality Score: {avg_q}/100")
-            lines.append(
-                f"   📌 Pinned: {pinned}   🗄 Archived: {archived}   🚦 Breaker: {breaker_state}   👷 Workers: {workers}"
-            )
+            lines.append(f"   📌 Pinned: {pinned}   🗄 Archived: {archived}   🚦 Breaker: {breaker_state}")
         return "\n".join(lines)
 
 
 # ============================================================================
-# TELEGRAM ADMIN UI (migration-free; per-platform Add File support)
+# TELEGRAM ADMIN UI (incl. V4 Settings / Migration panels)
 # ============================================================================
 
 class TelegramAdminUI:
@@ -2714,18 +2325,18 @@ class TelegramAdminUI:
         db: Database,
         scheduler: Optional[WorkerScheduler],
         reports: ReportEngine,
+        migration: MigrationService,
     ) -> None:
         self.db = db
         self.scheduler = scheduler
         self.reports = reports
+        self.migration = migration
         self.bot: Optional[Client] = None
         self.log_channels = {
             "youtube": Config.YOUTUBE_LOG_CHANNEL_ID,
             "instagram": Config.INSTAGRAM_LOG_CHANNEL_ID,
             "tiktok": Config.TIKTOK_LOG_CHANNEL_ID,
         }
-        # Requirement #6: user_id -> platform awaiting a fast-tracked file.
-        self.pending_file_platform: Dict[int, str] = {}
 
     async def notify_platform(self, platform: str, text: str) -> None:
         if not self.bot:
@@ -2772,6 +2383,9 @@ class TelegramAdminUI:
                     InlineKeyboardButton("➕ Add Source", callback_data="btn_add_source"),
                     InlineKeyboardButton("⚡ Manual Priority Check", callback_data="btn_manual_prompt"),
                 ],
+                [
+                    InlineKeyboardButton("⚙️ Settings (Legacy Migration)", callback_data="btn_settings"),
+                ],
             ]
         )
 
@@ -2781,7 +2395,6 @@ class TelegramAdminUI:
         return InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("📥 Export Working (Best Quality First)", callback_data=f"exp_{platform}")],
-                [InlineKeyboardButton("📥 Add File", callback_data=f"addfile_{platform}")],
                 [
                     InlineKeyboardButton(toggle_text, callback_data=f"toggle_{platform}"),
                     InlineKeyboardButton("♻️ Refresh Pool", callback_data=f"ref_{platform}"),
@@ -2790,16 +2403,29 @@ class TelegramAdminUI:
             ]
         )
 
+    
     async def setup(self) -> None:
         if Client is None:
             logger.warning("[TG] pyrogram not available; Telegram Admin UI disabled.")
             return
 
+        api_id_str = os.getenv("API_ID")
+        if not api_id_str:
+            raise ValueError("API_ID environment variable is required for Telegram Admin UI")
+        try:
+            api_id = int(api_id_str)
+        except ValueError:
+            raise ValueError("API_ID must be a valid integer")
+
+        api_hash = os.getenv("API_HASH")
+        if not api_hash:
+            raise ValueError("API_HASH environment variable is required for Telegram Admin UI")
+
         self.bot = Client(
-            "proxy_worker_v5",
+            "proxy_worker_v4",
             bot_token=Config.BOT_TOKEN,
-            api_id=env_int("API_ID", 12345),
-            api_hash=os.getenv("API_HASH", "placeholder").strip(),
+            api_id=api_id,
+            api_hash=api_hash.strip(),
             in_memory=True,
         )
 
@@ -2808,7 +2434,7 @@ class TelegramAdminUI:
             if not self.is_authorized(message.from_user.id):
                 return
             await message.reply_text(
-                "🤖 **Proxy Worker Bot v5 (Multi-Platform)**\nSelect a platform panel below:",
+                "🤖 **Proxy Worker Bot v4 (Multi-Platform)**\nSelect a platform panel below:",
                 reply_markup=self.main_dashboard_markup(),
             )
 
@@ -2823,7 +2449,7 @@ class TelegramAdminUI:
             proxies = [p.strip() for p in parts[1].split() if p.strip()]
             wait_msg = await message.reply_text("⚡ Pausing queue and executing manual priority check across platforms...")
             res = await self.scheduler.manual_priority_check(proxies)
-            await wait_msg.edit_text(res[:4000])
+            await wait_msg.edit_text(res)
 
         @self.bot.on_message(filters.command("digest") & filters.private)
         async def _cmd_digest(_, message: Message):
@@ -2866,52 +2492,23 @@ class TelegramAdminUI:
         async def _on_document_upload(_, message: Message):
             if not self.is_authorized(message.from_user.id):
                 return
+            fname = message.document.file_name.lower()
+            if not any(fname.endswith(f".{ext}") for ext in ("txt", "json", "csv")):
+                await message.reply_text("❌ Only .txt, .json, or .csv files are supported.")
+                return
 
-            user_id = message.from_user.id
-            pending_platform = self.pending_file_platform.pop(user_id, None)
-
-            wait_msg = await message.reply_text("📥 Downloading & analyzing proxy list...")
+            wait_msg = await message.reply_text("📥 Downloading & ingesting proxy list...")
             fpath = await message.download()
             try:
                 with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
                     raw_text = fh.read()
+                candidates = parse_source_payload(raw_text, "", fname)
+                proxies = [c.raw for c in candidates]
+                res = await self.scheduler.manual_priority_check(proxies)
+                await wait_msg.edit_text(f"📁 Ingestion Summary for `{message.document.file_name}`:\n\n{res[:3800]}")
             finally:
                 if os.path.exists(fpath):
                     os.remove(fpath)
-
-            # Requirement #12: format-agnostic - content is sniffed
-            # regardless of the file's extension.
-            candidates = sniff_and_parse(raw_text)
-            proxies = [c.raw for c in candidates]
-            if not proxies:
-                await wait_msg.edit_text("❌ No valid proxy entries could be detected in that file.")
-                return
-
-            if pending_platform:
-                # Requirement #6: platform-specific fast-track with
-                # live-edited progress.
-                await wait_msg.edit_text(
-                    f"📥 Fast-tracking {len(proxies)} proxies for {pending_platform.title()}...\nStarting..."
-                )
-
-                async def progress_cb(counts: Dict[str, int], recent_lines: List[str], total: int) -> None:
-                    text = (
-                        f"📥 Testing for {pending_platform.title()}: {counts['done']}/{total}\n"
-                        f"✅ Working: {counts['working']}  ❌ Failed: {counts['failed']}  "
-                        f"⚠️ Invalid: {counts['invalid']}\n\n" + "\n".join(recent_lines)
-                    )
-                    try:
-                        await wait_msg.edit_text(text[:4000])
-                    except Exception:
-                        pass
-
-                summary = await self.scheduler.platform_priority_check(pending_platform, proxies, progress_cb)
-                await wait_msg.edit_text(summary)
-            else:
-                # Global upload: unchanged behavior, tests against all
-                # three platforms.
-                res = await self.scheduler.manual_priority_check(proxies)
-                await wait_msg.edit_text(f"📁 Ingestion Summary ({len(proxies)} parsed):\n\n{res[:3800]}")
 
         @self.bot.on_callback_query()
         async def _on_callback(_, query: CallbackQuery):
@@ -2922,7 +2519,7 @@ class TelegramAdminUI:
             data = query.data
             if data == "panel_main":
                 await query.message.edit_text(
-                    "🤖 **Proxy Worker Bot v5 (Multi-Platform)**\nSelect a platform panel below:",
+                    "🤖 **Proxy Worker Bot v4 (Multi-Platform)**\nSelect a platform panel below:",
                     reply_markup=self.main_dashboard_markup(),
                 )
 
@@ -2943,16 +2540,6 @@ class TelegramAdminUI:
                     f"📈 Avg Quality Score: `{avg_q}/100`"
                 )
                 await query.message.edit_text(text, reply_markup=self.platform_subpanel_markup(p, enabled))
-
-            elif data.startswith("addfile_"):
-                p = data.split("_", 1)[1]
-                self.pending_file_platform[query.from_user.id] = p
-                await query.answer(f"Send a proxy file for {p.title()} now.")
-                await query.message.reply_text(
-                    f"📥 Send a proxy list file for **{p.title()}** now (any common format — .txt/.csv/.json, "
-                    f"or even no extension). It will be fast-tracked and tested only against {p.title()}, "
-                    f"with live progress shown here."
-                )
 
             elif data.startswith("exp_"):
                 p = data.split("_")[1]
@@ -3014,6 +2601,9 @@ class TelegramAdminUI:
                     "Send `/addproxy <url>` or paste a block of proxies directly into chat."
                 )
 
+            # --- V4: Settings / Migration panels ---
+
+            
             await query.answer()
 
     async def start(self) -> None:
@@ -3048,7 +2638,7 @@ class HealthServer:
         self.runner: Optional[web.AppRunner] = None
 
     async def handle_root(self, _) -> web.Response:
-        return web.json_response({"service": "proxy-worker-bot-v5", "status": "running"})
+        return web.json_response({"service": "proxy-worker-bot-v4", "status": "running"})
 
     async def handle_health(self, _) -> web.Response:
         db_ok = await self.db.ping()
@@ -3058,7 +2648,6 @@ class HealthServer:
             stats[p] = await self.db.get_platform_stats(p)
             stats[p]["breaker_state"] = self.scheduler.breakers[p].state
             stats[p]["archived"] = await self.db.count_archived(p)
-            stats[p]["active_workers"] = len([t for t in self.scheduler.worker_tasks[p] if not t.done()])
 
         return web.json_response(
             {
@@ -3066,7 +2655,7 @@ class HealthServer:
                 "mongo": db_ok,
                 "active_tests": self.scheduler.active_tests,
                 "platform_stats": stats,
-                "active_collections": Config.COLLECTION_NAMES,
+                "active_collections": Config.NEW_COLLECTION_NAMES,
             },
             status=status,
         )
@@ -3096,8 +2685,9 @@ class Application:
         self.db = Database()
         self.sources = ProxySourceManager(self.db)
         self.engine = ValidationEngine()
+        self.migration = MigrationService(self.db, self.engine)
         self.reports = ReportEngine(self.db)
-        self.admin_ui = TelegramAdminUI(self.db, None, self.reports)
+        self.admin_ui = TelegramAdminUI(self.db, None, self.reports, self.migration)
         self.scheduler = WorkerScheduler(self.db, self.sources, self.engine, self.admin_ui.notify_platform)
         self.admin_ui.scheduler = self.scheduler
         self.reports.scheduler = self.scheduler
@@ -3113,14 +2703,13 @@ class Application:
         await self.health_server.start()
 
         start_msg = (
-            "🚀 **Proxy Worker Bot v5 Online**\n"
-            "• Platforms: YouTube, Instagram, TikTok (fully independent state machines)\n"
-            f"• Active collections: {', '.join(Config.COLLECTION_NAMES.values())}\n"
-            "• Legacy migration system fully removed\n"
-            "• Per-proxy-only 429 cooldowns — no platform-wide freezes\n"
-            "• Adaptive multi-worker validation pools per platform\n"
-            "• Quality-ranked claim_proxy() selection + <=2h non-destructive requeue\n"
-            "• Per-platform \"Add File\" fast-track with live progress"
+            "🚀 **Proxy Worker Bot v4 Online**\n"
+            "• Platforms: YouTube, Instagram, TikTok\n"
+            f"• Active collections: {', '.join(Config.NEW_COLLECTION_NAMES.values())}\n"
+            "• Legacy collections preserved read-only for Settings-based migration\n"
+            "• State Machine: Staged Revalidation Active\n"
+            "• New: Quality scoring, circuit breaker, bandwidth guard, pruning, pinning, "
+            "cross-platform reuse, reputation memory, export diffing, migration audit log"
         )
         await self.admin_ui.notify_platform("youtube", start_msg)
         logger.info("[APP] Initialization fully complete.")
