@@ -576,8 +576,15 @@ def parse_csv_payload(text: str) -> List[ParsedCandidate]:
             proto = col(row, "protocol") or col(row, "scheme") or col(row, "type")
             country = col(row, "country") or col(row, "country_code") or col(row, "cc")
             anon = col(row, "anonymity")
+
+            # Handle username/password for proxy authentication
+            user = col(row, "user") or col(row, "username")
+            password = col(row, "pass") or col(row, "password")
+
             if ip and port:
-                candidate = f"{proto + '://' if proto else ''}{ip}:{port}"
+                # Build proxy URL with credentials if present
+                auth_part = f"{user}:{password}@" if user and password is not None else ""
+                candidate = f"{proto + '://' if proto else ''}{auth_part}{ip}:{port}"
                 out.append(ParsedCandidate(raw=candidate, scheme_hint=proto, country=country, anonymity=anon))
         else:
             joined = ":".join(c.strip() for c in row if c.strip())
@@ -2273,6 +2280,8 @@ class WorkerScheduler:
             p: BandwidthBudget(Config.PER_PLATFORM_TEST_BUDGET, Config.BANDWIDTH_BUDGET_WINDOW_SECONDS)
             for p in ALL_PLATFORMS
         }
+        # Throttle working proxy notifications to prevent Telegram FloodWait errors
+        self._last_notification_time: Dict[str, float] = {p: 0.0 for p in ALL_PLATFORMS}
 
     async def start(self) -> None:
         self.running = True
@@ -2428,6 +2437,12 @@ class WorkerScheduler:
     async def _handle_platform_notification(self, platform: str, doc: Dict[str, Any], meta: Dict[str, Any]) -> None:
         if not meta.get("now_working"):
             return
+
+        # Throttle notifications to prevent Telegram FloodWait errors (max 1 per 2 seconds per platform)
+        now = time.monotonic()
+        if now - self._last_notification_time[platform] < 2.0:
+            return
+        self._last_notification_time[platform] = now
 
         proxy_str = mask_proxy_string(doc.get("proxy_url", ""))
         country = doc.get("verified_country") or doc.get("source_country") or "UNKNOWN"
